@@ -16,6 +16,10 @@
 (define-constant ERR_INVALID_AMENDMENT_PROPOSER (err u109))
 (define-constant ERR_AMENDMENT_NOT_APPROVED (err u110))
 (define-constant ERR_AMENDMENT_VOTING_ENDED (err u111))
+(define-constant ERR_INVALID_CATEGORY (err u112))
+(define-constant ERR_EXPERTISE_NOT_FOUND (err u113))
+(define-constant ERR_INSUFFICIENT_EXPERTISE (err u114))
+(define-constant ERR_CATEGORY_ALREADY_EXISTS (err u115))
 
 (define-constant PROPOSAL_STAKE u1000000)
 (define-constant VOTING_PERIOD u1440)
@@ -23,8 +27,11 @@
 (define-constant AMENDMENT_STAKE u500000)
 (define-constant AMENDMENT_APPROVAL_THRESHOLD u5)
 (define-constant AMENDMENT_VOTING_PERIOD u720)
+(define-constant MIN_EXPERTISE_FOR_CATEGORY u50)
+(define-constant EXPERTISE_VOTE_MULTIPLIER u2)
 
 (define-data-var proposal-counter uint u0)
+(define-data-var category-counter uint u0)
 (define-data-var total-citizens uint u0)
 (define-data-var amendment-counter uint u0)
 
@@ -41,7 +48,8 @@
     no-votes: uint,
     total-votes: uint,
     executed: bool,
-    stake: uint
+    stake: uint,
+    category: uint
   }
 )
 
@@ -96,6 +104,33 @@
   (list 50 uint)
 )
 
+(define-map proposal-categories
+  uint
+  {
+    id: uint,
+    name: (string-ascii 50),
+    description: (string-ascii 200),
+    created-by: principal,
+    created-at: uint,
+    active: bool
+  }
+)
+
+(define-map citizen-expertise
+  { citizen: principal, category: uint }
+  {
+    level: uint,
+    successful-votes: uint,
+    total-votes: uint,
+    last-updated: uint
+  }
+)
+
+(define-map category-experts
+  uint
+  (list 100 principal)
+)
+
 (define-public (register-citizen)
   (let ((caller tx-sender))
     (match (map-get? citizen-registry caller)
@@ -115,7 +150,7 @@
   )
 )
 
-(define-public (submit-proposal (title (string-ascii 100)) (description (string-ascii 500)))
+(define-public (submit-proposal (title (string-ascii 100)) (description (string-ascii 500)) (category uint))
   (let (
     (caller tx-sender)
     (proposal-id (+ (var-get proposal-counter) u1))
@@ -124,26 +159,34 @@
     (match (map-get? citizen-registry caller)
       citizen-data
       (if (get registered citizen-data)
-        (begin
-          (try! (stx-transfer? PROPOSAL_STAKE caller (as-contract tx-sender)))
-          (map-set proposals proposal-id {
-            id: proposal-id,
-            title: title,
-            description: description,
-            proposer: caller,
-            created-at: current-block,
-            voting-ends-at: (+ current-block VOTING_PERIOD),
-            yes-votes: u0,
-            no-votes: u0,
-            total-votes: u0,
-            executed: false,
-            stake: PROPOSAL_STAKE
-          })
-          (map-set citizen-registry caller
-            (merge citizen-data { proposals-created: (+ (get proposals-created citizen-data) u1) })
+        (match (map-get? proposal-categories category)
+          category-data
+          (if (get active category-data)
+            (begin
+              (try! (stx-transfer? PROPOSAL_STAKE caller (as-contract tx-sender)))
+              (map-set proposals proposal-id {
+                id: proposal-id,
+                title: title,
+                description: description,
+                proposer: caller,
+                created-at: current-block,
+                voting-ends-at: (+ current-block VOTING_PERIOD),
+                yes-votes: u0,
+                no-votes: u0,
+                total-votes: u0,
+                executed: false,
+                stake: PROPOSAL_STAKE,
+                category: category
+              })
+              (map-set citizen-registry caller
+                (merge citizen-data { proposals-created: (+ (get proposals-created citizen-data) u1) })
+              )
+              (var-set proposal-counter proposal-id)
+              (ok proposal-id)
+            )
+            ERR_INVALID_CATEGORY
           )
-          (var-set proposal-counter proposal-id)
-          (ok proposal-id)
+          ERR_INVALID_CATEGORY
         )
         ERR_NOT_AUTHORIZED
       )
@@ -451,6 +494,195 @@
   )
 )
 
+(define-public (create-category (name (string-ascii 50)) (description (string-ascii 200)))
+  (let (
+    (caller tx-sender)
+    (category-id (+ (var-get category-counter) u1))
+    (current-block stacks-block-height)
+  )
+    (match (map-get? citizen-registry caller)
+      citizen-data
+      (if (and 
+        (get registered citizen-data)
+        (>= (get reputation citizen-data) MIN_EXPERTISE_FOR_CATEGORY)
+      )
+        (begin
+          (map-set proposal-categories category-id {
+            id: category-id,
+            name: name,
+            description: description,
+            created-by: caller,
+            created-at: current-block,
+            active: true
+          })
+          (var-set category-counter category-id)
+          (ok category-id)
+        )
+        ERR_INSUFFICIENT_EXPERTISE
+      )
+      ERR_NOT_AUTHORIZED
+    )
+  )
+)
+
+(define-public (declare-expertise (category uint))
+  (let (
+    (caller tx-sender)
+    (current-block stacks-block-height)
+  )
+    (match (map-get? citizen-registry caller)
+      citizen-data
+      (if (get registered citizen-data)
+        (match (map-get? proposal-categories category)
+          category-data
+          (if (get active category-data)
+            (match (map-get? citizen-expertise { citizen: caller, category: category })
+              existing-expertise ERR_NOT_AUTHORIZED
+              (begin
+                (map-set citizen-expertise { citizen: caller, category: category } {
+                  level: u1,
+                  successful-votes: u0,
+                  total-votes: u0,
+                  last-updated: current-block
+                })
+                (map-set category-experts category
+                  (unwrap-panic (as-max-len? 
+                    (append (default-to (list) (map-get? category-experts category)) caller)
+                    u100
+                  ))
+                )
+                (ok true)
+              )
+            )
+            ERR_INVALID_CATEGORY
+          )
+          ERR_INVALID_CATEGORY
+        )
+        ERR_NOT_AUTHORIZED
+      )
+      ERR_NOT_AUTHORIZED
+    )
+  )
+)
+
+(define-public (vote-on-proposal-with-expertise (proposal-id uint) (vote-yes bool))
+  (let (
+    (caller tx-sender)
+    (current-block stacks-block-height)
+  )
+    (match (map-get? citizen-registry caller)
+      citizen-data
+      (if (get registered citizen-data)
+        (match (map-get? proposals proposal-id)
+          proposal-data
+          (if (< current-block (get voting-ends-at proposal-data))
+            (match (map-get? votes { proposal-id: proposal-id, voter: caller })
+              existing-vote ERR_ALREADY_VOTED
+              (let (
+                (category (get category proposal-data))
+                (base-weight (calculate-vote-weight caller))
+                (expertise-multiplier (get-expertise-multiplier caller category))
+                (final-weight (* base-weight expertise-multiplier))
+                (updated-yes-votes (if vote-yes 
+                  (+ (get yes-votes proposal-data) final-weight) 
+                  (get yes-votes proposal-data)))
+                (updated-no-votes (if vote-yes 
+                  (get no-votes proposal-data) 
+                  (+ (get no-votes proposal-data) final-weight)))
+              )
+                (map-set votes { proposal-id: proposal-id, voter: caller } 
+                  { vote: vote-yes, weight: final-weight })
+                (map-set proposals proposal-id
+                  (merge proposal-data {
+                    yes-votes: updated-yes-votes,
+                    no-votes: updated-no-votes,
+                    total-votes: (+ (get total-votes proposal-data) final-weight)
+                  })
+                )
+                (map-set citizen-registry caller
+                  (merge citizen-data { 
+                    votes-cast: (+ (get votes-cast citizen-data) u1),
+                    reputation: (+ (get reputation citizen-data) u1)
+                  })
+                )
+                (update-expertise-after-vote caller category)
+                (ok true)
+              )
+            )
+            ERR_VOTING_ENDED
+          )
+          ERR_PROPOSAL_NOT_FOUND
+        )
+        ERR_NOT_AUTHORIZED
+      )
+      ERR_NOT_AUTHORIZED
+    )
+  )
+)
+
+(define-private (get-expertise-multiplier (citizen principal) (category uint))
+  (match (map-get? citizen-expertise { citizen: citizen, category: category })
+    expertise-data
+    (if (>= (get level expertise-data) u1)
+      EXPERTISE_VOTE_MULTIPLIER
+      u1
+    )
+    u1
+  )
+)
+
+(define-private (update-expertise-after-vote (citizen principal) (category uint))
+  (match (map-get? citizen-expertise { citizen: citizen, category: category })
+    expertise-data
+    (map-set citizen-expertise { citizen: citizen, category: category }
+      (merge expertise-data { 
+        total-votes: (+ (get total-votes expertise-data) u1),
+        last-updated: stacks-block-height
+      })
+    )
+    true
+  )
+)
+
+(define-public (update-expertise-on-proposal-success (proposal-id uint))
+  (let ((current-block stacks-block-height))
+    (match (map-get? proposals proposal-id)
+      proposal-data
+      (if (and 
+        (>= current-block (get voting-ends-at proposal-data))
+        (get executed proposal-data)
+        (> (get yes-votes proposal-data) (get no-votes proposal-data))
+      )
+        (let ((category (get category proposal-data)))
+          (update-all-expertise-for-category category proposal-id)
+          (ok true)
+        )
+        ERR_VOTING_NOT_ENDED
+      )
+      ERR_PROPOSAL_NOT_FOUND
+    )
+  )
+)
+
+(define-private (update-all-expertise-for-category (category uint) (proposal-id uint))
+  (match (map-get? category-experts category)
+    experts-list
+    (fold update-single-expert-for-proposal experts-list true)
+    true
+  )
+)
+
+(define-private (update-single-expert-for-proposal (expert principal) (acc bool))
+  (begin
+    (update-expert-expertise-for-current-proposal expert)
+    acc
+  )
+)
+
+(define-private (update-expert-expertise-for-current-proposal (expert principal))
+  true
+)
+
 (define-read-only (get-proposal (proposal-id uint))
   (map-get? proposals proposal-id)
 )
@@ -512,6 +744,65 @@
 
 (define-read-only (get-citizen-vote-weight (citizen principal))
   (calculate-vote-weight citizen)
+)
+
+(define-read-only (get-category (category-id uint))
+  (map-get? proposal-categories category-id)
+)
+
+(define-read-only (get-citizen-expertise (citizen principal) (category uint))
+  (map-get? citizen-expertise { citizen: citizen, category: category })
+)
+
+(define-read-only (get-category-experts (category uint))
+  (default-to (list) (map-get? category-experts category))
+)
+
+(define-read-only (get-category-count)
+  (var-get category-counter)
+)
+
+(define-read-only (get-proposals-by-category (category uint))
+  (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10)
+)
+
+(define-private (is-proposal-in-category (proposal-id uint) (target-category uint))
+  (match (map-get? proposals proposal-id)
+    proposal-data
+    (is-eq (get category proposal-data) target-category)
+    false
+  )
+)
+
+(define-read-only (get-citizen-expertise-level (citizen principal) (category uint))
+  (match (map-get? citizen-expertise { citizen: citizen, category: category })
+    expertise-data
+    (get level expertise-data)
+    u0
+  )
+)
+
+(define-read-only (get-expertise-vote-weight (citizen principal) (category uint))
+  (let (
+    (base-weight (calculate-vote-weight citizen))
+    (multiplier (get-expertise-multiplier citizen category))
+  )
+    (* base-weight multiplier)
+  )
+)
+
+(define-read-only (get-active-categories)
+  (filter is-category-active (list 
+    u1 u2 u3 u4 u5 u6 u7 u8 u9 u10 u11 u12 u13 u14 u15 u16 u17 u18 u19 u20
+  ))
+)
+
+(define-private (is-category-active (category-id uint))
+  (match (map-get? proposal-categories category-id)
+    category-data
+    (get active category-data)
+    false
+  )
 )
 
 (define-read-only (get-amendment (amendment-id uint))
@@ -590,3 +881,6 @@
     false
   )
 )
+
+
+
