@@ -29,8 +29,15 @@
 (define-constant AMENDMENT_VOTING_PERIOD u720)
 (define-constant MIN_EXPERTISE_FOR_CATEGORY u50)
 (define-constant EXPERTISE_VOTE_MULTIPLIER u2)
+(define-constant ERR_MILESTONE_NOT_FOUND (err u116))
+(define-constant ERR_MILESTONE_ALREADY_COMPLETED (err u117))
+(define-constant ERR_NOT_MILESTONE_PROPOSER (err u118))
+(define-constant ERR_PROPOSAL_NOT_EXECUTED (err u119))
+(define-constant ERR_MILESTONE_DEADLINE_PASSED (err u120))
+(define-constant MAX_MILESTONES_PER_PROPOSAL u10)
 
 (define-data-var proposal-counter uint u0)
+(define-data-var milestone-counter uint u0)
 (define-data-var category-counter uint u0)
 (define-data-var total-citizens uint u0)
 (define-data-var amendment-counter uint u0)
@@ -129,6 +136,28 @@
 (define-map category-experts
   uint
   (list 100 principal)
+)
+
+;; Proposal milestone system maps
+(define-map proposal-milestones
+  uint
+  {
+    id: uint,
+    proposal-id: uint,
+    title: (string-ascii 100),
+    description: (string-ascii 300),
+    deadline: uint,
+    completed: bool,
+    completion-date: (optional uint),
+    completed-by: (optional principal),
+    created-at: uint,
+    order: uint
+  }
+)
+
+(define-map proposal-milestone-list
+  uint
+  (list 10 uint)
 )
 
 (define-public (register-citizen)
@@ -880,6 +909,207 @@
     (< stacks-block-height (get voting-ends-at proposal-data))
     false
   )
+)
+
+;; Milestone Management Functions
+
+;; Create milestone for executed proposal
+(define-public (create-milestone 
+  (proposal-id uint) 
+  (title (string-ascii 100)) 
+  (description (string-ascii 300)) 
+  (deadline uint)
+  (order uint))
+  (let (
+    (caller tx-sender)
+    (milestone-id (+ (var-get milestone-counter) u1))
+    (current-block stacks-block-height)
+  )
+    (match (map-get? proposals proposal-id)
+      proposal-data
+      (if (and 
+        (get executed proposal-data)
+        (or (is-eq caller (get proposer proposal-data)) 
+            (is-eq caller CONTRACT_OWNER))
+        (> deadline current-block)
+      )
+        (let (
+          (current-milestones (default-to (list) (map-get? proposal-milestone-list proposal-id)))
+          (milestone-count (len current-milestones))
+        )
+          (if (< milestone-count MAX_MILESTONES_PER_PROPOSAL)
+            (begin
+              (map-set proposal-milestones milestone-id {
+                id: milestone-id,
+                proposal-id: proposal-id,
+                title: title,
+                description: description,
+                deadline: deadline,
+                completed: false,
+                completion-date: none,
+                completed-by: none,
+                created-at: current-block,
+                order: order
+              })
+              (map-set proposal-milestone-list proposal-id
+                (unwrap-panic (as-max-len? (append current-milestones milestone-id) u10))
+              )
+              (var-set milestone-counter milestone-id)
+              (ok milestone-id)
+            )
+            ERR_NOT_AUTHORIZED
+          )
+        )
+        (if (not (get executed proposal-data))
+          ERR_PROPOSAL_NOT_EXECUTED
+          (if (<= deadline current-block)
+            ERR_MILESTONE_DEADLINE_PASSED
+            ERR_NOT_MILESTONE_PROPOSER
+          )
+        )
+      )
+      ERR_PROPOSAL_NOT_FOUND
+    )
+  )
+)
+
+;; Mark milestone as completed
+(define-public (complete-milestone (milestone-id uint))
+  (let (
+    (caller tx-sender)
+    (current-block stacks-block-height)
+  )
+    (match (map-get? proposal-milestones milestone-id)
+      milestone-data
+      (if (not (get completed milestone-data))
+        (match (map-get? proposals (get proposal-id milestone-data))
+          proposal-data
+          (if (or 
+            (is-eq caller (get proposer proposal-data))
+            (is-eq caller CONTRACT_OWNER)
+          )
+            (if (<= current-block (get deadline milestone-data))
+              (begin
+                (map-set proposal-milestones milestone-id
+                  (merge milestone-data {
+                    completed: true,
+                    completion-date: (some current-block),
+                    completed-by: (some caller)
+                  })
+                )
+                ;; Award reputation bonus for completing milestone on time
+                (match (map-get? citizen-registry caller)
+                  citizen-data
+                  (map-set citizen-registry caller
+                    (merge citizen-data { 
+                      reputation: (+ (get reputation citizen-data) u10) 
+                    })
+                  )
+                  true
+                )
+                (ok true)
+              )
+              (begin
+                ;; Still allow completion but with reduced reputation
+                (map-set proposal-milestones milestone-id
+                  (merge milestone-data {
+                    completed: true,
+                    completion-date: (some current-block),
+                    completed-by: (some caller)
+                  })
+                )
+                (ok true)
+              )
+            )
+            ERR_NOT_MILESTONE_PROPOSER
+          )
+          ERR_PROPOSAL_NOT_FOUND
+        )
+        ERR_MILESTONE_ALREADY_COMPLETED
+      )
+      ERR_MILESTONE_NOT_FOUND
+    )
+  )
+)
+
+;; Milestone Query Functions
+
+;; Get milestone details
+(define-read-only (get-milestone (milestone-id uint))
+  (map-get? proposal-milestones milestone-id)
+)
+
+;; Get all milestones for a proposal
+(define-read-only (get-proposal-milestones (proposal-id uint))
+  (default-to (list) (map-get? proposal-milestone-list proposal-id))
+)
+
+;; Get milestone count
+(define-read-only (get-milestone-count)
+  (var-get milestone-counter)
+)
+
+;; Calculate proposal progress percentage
+(define-read-only (get-proposal-progress (proposal-id uint))
+  (let (
+    (milestones (default-to (list) (map-get? proposal-milestone-list proposal-id)))
+    (total-milestones (len milestones))
+  )
+    (if (> total-milestones u0)
+      (let (
+        (completed-count (count-completed-milestones milestones))
+        (progress (/ (* completed-count u100) total-milestones))
+      )
+        (some { 
+          completed: completed-count, 
+          total: total-milestones, 
+          percentage: progress 
+        })
+      )
+      none
+    )
+  )
+)
+
+;; Check if milestone is overdue
+(define-read-only (is-milestone-overdue (milestone-id uint))
+  (match (map-get? proposal-milestones milestone-id)
+    milestone-data
+    (and 
+      (not (get completed milestone-data))
+      (> stacks-block-height (get deadline milestone-data))
+    )
+    false
+  )
+)
+
+;; Get overdue milestones for a proposal
+(define-read-only (get-overdue-milestones (proposal-id uint))
+  (let (
+    (milestones (default-to (list) (map-get? proposal-milestone-list proposal-id)))
+  )
+    (filter-overdue-milestones milestones)
+  )
+)
+
+;; Private helper functions
+(define-private (count-completed-milestones (milestones (list 10 uint)))
+  (fold check-milestone-completion milestones u0)
+)
+
+(define-private (check-milestone-completion (milestone-id uint) (count uint))
+  (match (map-get? proposal-milestones milestone-id)
+    milestone-data
+    (if (get completed milestone-data)
+      (+ count u1)
+      count
+    )
+    count
+  )
+)
+
+(define-private (filter-overdue-milestones (milestones (list 10 uint)))
+  (filter is-milestone-overdue milestones)
 )
 
 
